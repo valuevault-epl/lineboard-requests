@@ -85,6 +85,21 @@ jobs:
           cat request.json
           python models/runner/cloud_refresh.py request.json $NOPUSH
 
+      - name: Keep the run's files for checking
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nba-output
+          retention-days: 3
+          path: |
+            models/NBAModel/output/*.csv
+            models/NBAModel/output/*.txt
+          if-no-files-found: ignore
+
+      - name: List the data cache
+        if: always()
+        run: ls -la models/NBAModel/data/cache | awk '{print $5, $9}'
+
       - name: Save the data cache
         if: always()
         uses: actions/cache/save@v4
