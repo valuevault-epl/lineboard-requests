@@ -1,0 +1,93 @@
+# Runs the Line Board models in the cloud when the phone asks for a refresh (it writes refresh.json here), so a
+# refresh works with both laptops off. Same steps as the spare laptop's runner: runner/cloud_refresh.py in the
+# private models repo runs each asked-for league and publishes to the app with the request noted in data.json.
+# Keys: MODELS_KEY = read-only deploy key on lineboard-models, APP_KEY = deploy key that can push to lineboard.
+name: Refresh from the phone
+
+on:
+  push:
+    branches: [main]
+    paths: [refresh.json]
+  workflow_dispatch:
+    inputs:
+      leagues:
+        description: Leagues to run, comma-separated (nba, nbl, nfl)
+        default: nba
+      publish:
+        description: Publish to the phone app
+        type: boolean
+        default: false
+
+concurrency:
+  group: refresh
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      TZ: Australia/Melbourne
+      CLOUD_LEAGUES: NBA
+    steps:
+      - name: Read the request
+        uses: actions/checkout@v4
+        with:
+          path: req
+
+      - name: Model code
+        uses: actions/checkout@v4
+        with:
+          repository: valuevault-epl/lineboard-models
+          ssh-key: ${{ secrets.MODELS_KEY }}
+          path: models
+
+      - name: Phone app
+        uses: actions/checkout@v4
+        with:
+          repository: valuevault-epl/lineboard
+          ssh-key: ${{ secrets.APP_KEY }}
+          path: models/LineBoardApp
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: models/NBAModel/requirements.txt
+
+      - name: Install
+        run: pip install -q -r models/NBAModel/requirements.txt
+
+      - name: Restore the data cache
+        uses: actions/cache/restore@v4
+        with:
+          path: models/NBAModel/data/cache
+          key: nba-cache-${{ github.run_id }}
+          restore-keys: nba-cache-
+
+      - name: Run and publish
+        env:
+          EVENT: ${{ github.event_name }}
+          IN_LEAGUES: ${{ inputs.leagues }}
+          IN_PUBLISH: ${{ inputs.publish }}
+        run: |
+          git config --global user.name valuevault-epl
+          git config --global user.email 320639260+valuevault-epl@users.noreply.github.com
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            python -c "import json, os, datetime as d; print(json.dumps({'id': 'manual-' + os.environ['GITHUB_RUN_ID'], 'leagues': [x.strip().lower() for x in os.environ['IN_LEAGUES'].split(',') if x.strip()], 'at': d.datetime.now(d.timezone.utc).isoformat()}))" > request.json
+            [ "$IN_PUBLISH" = "true" ] || NOPUSH=--no-push
+          else
+            cp req/refresh.json request.json
+          fi
+          cat request.json
+          python models/runner/cloud_refresh.py request.json $NOPUSH
+
+      - name: Save the data cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: models/NBAModel/data/cache
+          key: nba-cache-${{ github.run_id }}
