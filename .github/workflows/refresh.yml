@@ -96,10 +96,6 @@ jobs:
             models/NBAModel/output/*.txt
           if-no-files-found: ignore
 
-      - name: List the data cache
-        if: always()
-        run: ls -la models/NBAModel/data/cache | awk '{print $5, $9}'
-
       - name: Save the data cache
         if: always()
         uses: actions/cache/save@v4
