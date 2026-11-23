@@ -77,7 +77,8 @@ def props(gid):
     ref = next((((it.get('propBets') or {}).get('$ref')) for it in odds.get('items', []) if (it.get('propBets') or {}).get('$ref')), None)
     if not ref:
         return {}, None
-    src = next(((it.get('provider') or {}).get('name') for it in odds.get('items', []) if it.get('propBets')), 'DraftKings')
+    src = next(((it.get('provider') or {}).get('name') for it in odds.get('items', []) if it.get('propBets')), None) or 'DraftKings'
+    src = src.replace('Draft Kings', 'DraftKings')
     items, page = [], 1
     while True:
         d = get(f'{ref}&limit=1000&page={page}')
@@ -159,6 +160,9 @@ def main():
             p, src = props(gid)
         except Exception as e:
             log(f'{g["away"]}@{g["home"]}: failed ({e})')
+            continue
+        if not p:                                          # not posted yet: the next run tries again
+            log(f'{g["away"]}@{g["home"]}: no player props posted yet')
             continue
         at = dt.datetime.now(dt.timezone.utc)
         data['games'][gid] = {'tip': g['tip'].strftime('%Y-%m-%dT%H:%M:%SZ'), 'at': at.strftime('%Y-%m-%dT%H:%M:%SZ'),
