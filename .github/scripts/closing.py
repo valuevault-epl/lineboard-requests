@@ -37,8 +37,11 @@ LADDERS = {'Points Milestones': 'pts', 'Rebounds Milestones': 'reb', 'Assists Mi
            'Points + Rebounds Milestones': 'pr', 'Points + Assists Milestones': 'pa', 'Rebounds + Assists Milestones': 'ra',
            'Steals Milestones': 'stl', 'Blocks Milestones': 'blk'}
 LEAD = dt.timedelta(minutes=3)             # how long before tip-off the closing prices are taken
-WINDOW = dt.timedelta(minutes=int(os.environ.get('WINDOW', '50')))
+BUDGET = dt.timedelta(minutes=int(os.environ.get('BUDGET', '330')))   # one run waits at most this long (jobs stop at 6h)
 KEEP_DAYS = 6
+# GitHub's schedule is unreliable (on 23-24 Nov 2026 it fired twice in a day instead of 96 times), so a run also
+# starts when the phone asks (closing-request.json on main: {at, until}, written when bets are placed or the Bets tab
+# opens) and, while games up to 'until' still need their closing prices, each run starts the next one before it ends.
 
 
 def log(msg):
@@ -133,8 +136,33 @@ def push(path, msg):
     log('  push failed')
 
 
+def asked_until(path):
+    """The latest time the phone wants closing prices covered to (closing-request.json), or None."""
+    try:
+        with open(path, encoding='utf-8') as f:
+            return dt.datetime.fromisoformat(str(json.load(f)['until']).replace('Z', '+00:00'))
+    except Exception:
+        return None
+
+
+def next_run():
+    """Start the next run of this workflow (GITHUB_TOKEN can dispatch workflows)."""
+    repo, tok = os.environ.get('GITHUB_REPOSITORY'), os.environ.get('GITHUB_TOKEN')
+    if not repo or not tok:
+        return log('no token to start the next run')
+    req = urllib.request.Request(f'https://api.github.com/repos/{repo}/actions/workflows/closing.yml/dispatches', method='POST',
+                                 data=json.dumps({'ref': 'main'}).encode(), headers={'Authorization': f'Bearer {tok}',
+                                 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
+    try:
+        urllib.request.urlopen(req, timeout=30)
+        log('started the next run (games still to come before the requested time)')
+    except Exception as e:
+        log(f'could not start the next run: {e}')
+
+
 def main():
     path = sys.argv[1]
+    until = asked_until(sys.argv[2]) if len(sys.argv) > 2 else None
     test = bool(os.environ.get('TEST'))
     try:
         with open(path, encoding='utf-8') as f:
@@ -146,10 +174,13 @@ def main():
     keep_after = now - dt.timedelta(days=KEEP_DAYS)
     data['games'] = {k: v for k, v in data.get('games', {}).items()
                      if dt.datetime.fromisoformat(v['tip'].replace('Z', '+00:00')) > keep_after}
-    # not started yet (ESPN's state); tip-offs often run a few minutes past the scheduled time
+    # not started yet (ESPN's state); tip-offs often run a few minutes past the scheduled time. This run takes every
+    # such game it can reach within its time budget.
+    end = now + BUDGET
     todo = sorted(((gid, g) for gid, g in games.items() if g['state'] == 'pre' and g['tip'] > now - dt.timedelta(minutes=20)
-                   and (test or g['tip'] <= now + WINDOW) and gid not in data['games']), key=lambda x: x[1]['tip'])
-    log(f'{len(games)} games on the slate; to capture now: ' + (', '.join(f'{g["away"]}@{g["home"]} {g["tip"].astimezone(ET):%H:%M}' for _, g in todo) or 'none'))
+                   and (test or g['tip'] - LEAD <= end) and gid not in data['games']), key=lambda x: x[1]['tip'])
+    log(f'{len(games)} games on the slate' + (f'; asked to cover until {until.astimezone(ET):%a %H:%M} ET' if until else '')
+        + '; to capture in this run: ' + (', '.join(f'{g["away"]}@{g["home"]} {g["tip"].astimezone(ET):%H:%M}' for _, g in todo) or 'none'))
     for gid, g in todo:
         if not test:
             wait = (g['tip'] - LEAD - dt.datetime.now(dt.timezone.utc)).total_seconds()
@@ -173,6 +204,16 @@ def main():
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(data, f, separators=(',', ':'))
         push(path, f'Closing prop prices: {g["away"]} @ {g["home"]}')
+    # games the phone asked for that this run couldn't reach: hand over to a new run
+    if not test and until:
+        later = [g for gid, g in games.items() if g['state'] == 'pre' and gid not in data['games']
+                 and dt.datetime.now(dt.timezone.utc) + LEAD < g['tip'] <= until + dt.timedelta(minutes=5)]
+        if later:                                          # use this run's whole budget first: one hand-over per 5.5h
+            rest = (end - dt.datetime.now(dt.timezone.utc)).total_seconds()
+            if rest > 0:
+                log(f'next requested game {min(g["tip"] for g in later).astimezone(ET):%a %H:%M} ET is beyond this run; waiting {rest / 60:.0f} min, then handing over')
+                time.sleep(rest)
+            next_run()
 
 
 if __name__ == '__main__':

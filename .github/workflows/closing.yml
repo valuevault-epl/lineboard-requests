@@ -1,11 +1,16 @@
-# Closing prices for NBA player props (DraftKings via ESPN, free): every 15 minutes, any game tipping off within the
-# next 50 minutes is captured a few minutes before tip-off and saved to nba.json on the 'closing' branch. The Line Board
-# bet tracker reads it for each bet's closing line value, the bookie vig and the fair price. See .github/scripts/closing.py.
+# Closing prices for NBA player props (DraftKings via ESPN, free), taken a few minutes before each tip-off and saved
+# to nba.json on the 'closing' branch; the Line Board bet tracker reads it for each bet's closing line value, the bookie
+# vig and the fair price. A run waits up to 5.5 hours for games to come up. It starts on the schedule (unreliable on
+# GitHub), when the phone writes closing-request.json (bets placed / Bets tab opened), or from the previous run while
+# requested games are still to come. See .github/scripts/closing.py.
 name: Closing prop prices
 
 on:
   schedule:
     - cron: '4,19,34,49 * * * *'
+  push:
+    branches: [main]
+    paths: [closing-request.json]
   workflow_dispatch:
     inputs:
       test:
@@ -19,16 +24,20 @@ concurrency:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   capture:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
         with:
           path: main
-          sparse-checkout: .github/scripts
+          sparse-checkout: |
+            .github/scripts
+            closing-request.json
+          sparse-checkout-cone-mode: false
 
       - uses: actions/checkout@v4
         with:
@@ -38,8 +47,9 @@ jobs:
       - name: Capture
         env:
           TEST: ${{ inputs.test && '1' || '' }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           git -C data config user.name valuevault-epl
           git -C data config user.email 320639260+valuevault-epl@users.noreply.github.com
           if [ -n "$TEST" ]; then out=data/test.json; else out=data/nba.json; fi
-          python3 main/.github/scripts/closing.py "$out"
+          python3 main/.github/scripts/closing.py "$out" main/closing-request.json
