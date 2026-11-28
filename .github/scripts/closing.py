@@ -38,6 +38,9 @@ LADDERS = {'Points Milestones': 'pts', 'Rebounds Milestones': 'reb', 'Assists Mi
            'Steals Milestones': 'stl', 'Blocks Milestones': 'blk'}
 LEAD = dt.timedelta(minutes=3)             # how long before tip-off the closing prices are taken
 BUDGET = dt.timedelta(minutes=int(os.environ.get('BUDGET', '330')))   # one run waits at most this long (jobs stop at 6h)
+RETAKE = dt.timedelta(minutes=3)           # a captured game that still hasn't started is taken again this often
+CHECK = dt.timedelta(seconds=60)           # how often ESPN's scoreboard is asked whether captured games have started
+LATE = dt.timedelta(hours=3)               # a game still 'pre' is followed at most this long past its scheduled time
 KEEP_DAYS = 6
 # GitHub's schedule is unreliable (on 23-24 Nov 2026 it fired twice in a day instead of 96 times), so a run also
 # starts when the phone asks (closing-request.json on main: {at, until}, written when bets are placed or the Bets tab
@@ -160,6 +163,37 @@ def next_run():
         log(f'could not start the next run: {e}')
 
 
+def utcnow():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def save(path, data, msg):
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, separators=(',', ':'))
+    push(path, msg)
+
+
+def capture(gid, g, data, path, again=False):
+    """Take DraftKings' prices for one game now; True if there were any."""
+    try:
+        p, src = props(gid)
+    except Exception as e:
+        log(f'{g["away"]}@{g["home"]}: failed ({e})')
+        return False
+    if not p:                                              # not posted yet: tried again later
+        log(f'{g["away"]}@{g["home"]}: no player props posted yet')
+        return False
+    at = utcnow()
+    data['games'][gid] = {'tip': g['tip'].strftime('%Y-%m-%dT%H:%M:%SZ'), 'at': at.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                          'away': g['away'], 'home': g['home'], 'src': src or 'DraftKings', 'p': p, 'final': False}
+    data['updated'] = data['games'][gid]['at']
+    mins = (g['tip'] - at).total_seconds() / 60
+    log(f'{g["away"]}@{g["home"]}: {sum(len(v) for v in p.values())} lines for {len(p)} players ({src}), '
+        + (f'{mins:.0f} min before tip-off' if mins >= 0 else f'{-mins:.0f} min past its time and not started yet'))
+    save(path, data, f'Closing prop prices: {g["away"]} @ {g["home"]}' + (' (again: not started yet)' if again else ''))
+    return True
+
+
 def main():
     path = sys.argv[1]
     until = asked_until(sys.argv[2]) if len(sys.argv) > 2 else None
@@ -169,47 +203,56 @@ def main():
             data = json.load(f)
     except Exception:
         data = {'games': {}}
-    now = dt.datetime.now(dt.timezone.utc)
+    now = utcnow()
     games = slate(now)
     keep_after = now - dt.timedelta(days=KEEP_DAYS)
     data['games'] = {k: v for k, v in data.get('games', {}).items()
                      if dt.datetime.fromisoformat(v['tip'].replace('Z', '+00:00')) > keep_after}
-    # not started yet (ESPN's state); tip-offs often run a few minutes past the scheduled time. This run takes every
-    # such game it can reach within its time budget.
     end = now + BUDGET
-    todo = sorted(((gid, g) for gid, g in games.items() if g['state'] == 'pre' and g['tip'] > now - dt.timedelta(minutes=20)
-                   and (test or g['tip'] - LEAD <= end) and gid not in data['games']), key=lambda x: x[1]['tip'])
+    # games ESPN shows as not started (state 'pre'): tip-offs run late and games get pushed back, so a game is followed
+    # up to LATE past its scheduled time. First capture LEAD before the scheduled tip-off; then, while it still hasn't
+    # started, taken again every RETAKE; once ESPN says it has started, the last pre-game prices are marked final.
+    new = lambda gs, t: sorted(((gid, g) for gid, g in gs.items() if g['state'] == 'pre' and g['tip'] > t - LATE
+                                and gid not in data['games']), key=lambda x: x[1]['tip'])
+    todo = [(gid, g) for gid, g in new(games, now) if test or g['tip'] - LEAD <= end]
     log(f'{len(games)} games on the slate' + (f'; asked to cover until {until.astimezone(ET):%a %H:%M} ET' if until else '')
         + '; to capture in this run: ' + (', '.join(f'{g["away"]}@{g["home"]} {g["tip"].astimezone(ET):%H:%M}' for _, g in todo) or 'none'))
-    for gid, g in todo:
-        if not test:
-            wait = (g['tip'] - LEAD - dt.datetime.now(dt.timezone.utc)).total_seconds()
-            if wait > 0:
-                log(f'waiting {wait / 60:.0f} min for {g["away"]}@{g["home"]}')
-                time.sleep(wait)
-        try:
-            p, src = props(gid)
-        except Exception as e:
-            log(f'{g["away"]}@{g["home"]}: failed ({e})')
-            continue
-        if not p:                                          # not posted yet: the next run tries again
-            log(f'{g["away"]}@{g["home"]}: no player props posted yet')
-            continue
-        at = dt.datetime.now(dt.timezone.utc)
-        data['games'][gid] = {'tip': g['tip'].strftime('%Y-%m-%dT%H:%M:%SZ'), 'at': at.strftime('%Y-%m-%dT%H:%M:%SZ'),
-                              'away': g['away'], 'home': g['home'], 'src': src or 'DraftKings', 'p': p}
-        data['updated'] = data['games'][gid]['at']
-        n = sum(len(v) for v in p.values())
-        log(f'{g["away"]}@{g["home"]}: {n} lines for {len(p)} players ({src}), {(g["tip"] - at).total_seconds() / 60:.0f} min before tip-off')
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, separators=(',', ':'))
-        push(path, f'Closing prop prices: {g["away"]} @ {g["home"]}')
+    if test:
+        for gid, g in todo:
+            capture(gid, g, data, path)
+        return
+    watch = {gid for gid, v in data['games'].items() if not v.get('final') and gid in games}
+    next_check = now
+    while True:
+        now = utcnow()
+        if now >= end:
+            break
+        games = slate(now)
+        for gid, g in new(games, now):                     # first captures that are due
+            if g['tip'] - LEAD <= now and capture(gid, g, data, path):
+                watch.add(gid)
+        if watch and now >= next_check:                    # captured games: started yet?
+            for gid in sorted(watch):
+                g, v = games.get(gid), data['games'][gid]
+                tip = dt.datetime.fromisoformat(v['tip'].replace('Z', '+00:00'))
+                if not g or g['state'] != 'pre' or now > tip + LATE:
+                    v['final'] = True
+                    watch.discard(gid)
+                    log(f'{v["away"]}@{v["home"]} has started: prices from {v["at"][11:16]} UTC are the close')
+                    save(path, data, f'Closing prop prices final: {v["away"]} @ {v["home"]}')
+                elif now - dt.datetime.fromisoformat(v['at'].replace('Z', '+00:00')) >= RETAKE - dt.timedelta(seconds=10):
+                    capture(gid, g, data, path, again=True)
+            next_check = now + CHECK
+        times = [g['tip'] - LEAD for gid, g in new(games, now)] + ([next_check] if watch else [])
+        if not times or min(times) > end:
+            break
+        time.sleep(max(5, (min(times) - utcnow()).total_seconds()))
     # games the phone asked for that this run couldn't reach: hand over to a new run
-    if not test and until:
+    if until:
         later = [g for gid, g in games.items() if g['state'] == 'pre' and gid not in data['games']
-                 and dt.datetime.now(dt.timezone.utc) + LEAD < g['tip'] <= until + dt.timedelta(minutes=5)]
+                 and utcnow() + LEAD < g['tip'] <= until + dt.timedelta(minutes=5)]
         if later:                                          # use this run's whole budget first: one hand-over per 5.5h
-            rest = (end - dt.datetime.now(dt.timezone.utc)).total_seconds()
+            rest = (end - utcnow()).total_seconds()
             if rest > 0:
                 log(f'next requested game {min(g["tip"] for g in later).astimezone(ET):%a %H:%M} ET is beyond this run; waiting {rest / 60:.0f} min, then handing over')
                 time.sleep(rest)
